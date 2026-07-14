@@ -9,7 +9,6 @@ const HOST = process.env.HOST || "0.0.0.0";
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Memory instance - initialized on first request
 let memory: Memory | null = null;
 let initPromise: Promise<void> | null = null;
 
@@ -40,7 +39,6 @@ async function getMemory(): Promise<Memory> {
   return memory!;
 }
 
-// === Health ===
 app.get("/api/v1/health", (_req, res) => {
   res.json({
     status: "ok",
@@ -49,14 +47,12 @@ app.get("/api/v1/health", (_req, res) => {
   });
 });
 
-// === Metrics ===
 app.get("/api/v1/metrics", (_req, res) => {
   const m = memory?.getLastMetrics();
   if (!m) return res.status(404).json({ error: "No metrics available yet" });
   res.json(m);
 });
 
-// === Search (LLM不使用) ===
 app.post("/api/v1/search", async (req, res) => {
   try {
     const mem = await getMemory();
@@ -77,7 +73,6 @@ app.post("/api/v1/search", async (req, res) => {
   }
 });
 
-// === Consolidate (LLM使用) ===
 app.post("/api/v1/consolidate", async (req, res) => {
   try {
     const mem = await getMemory();
@@ -92,7 +87,6 @@ app.post("/api/v1/consolidate", async (req, res) => {
   }
 });
 
-// === Add Session ===
 app.post("/api/v1/session", async (req, res) => {
   try {
     const mem = await getMemory();
@@ -104,7 +98,6 @@ app.post("/api/v1/session", async (req, res) => {
   }
 });
 
-// === Reinforce ===
 app.post("/api/v1/reinforce", async (req, res) => {
   try {
     const mem = await getMemory();
@@ -119,7 +112,6 @@ app.post("/api/v1/reinforce", async (req, res) => {
   }
 });
 
-// === Archive Faded ===
 app.post("/api/v1/archive-faded", async (req, res) => {
   try {
     const mem = await getMemory();
@@ -131,7 +123,6 @@ app.post("/api/v1/archive-faded", async (req, res) => {
   }
 });
 
-// === Get Card ===
 app.get("/api/v1/cards/:id", async (req, res) => {
   try {
     const mem = await getMemory();
@@ -143,7 +134,6 @@ app.get("/api/v1/cards/:id", async (req, res) => {
   }
 });
 
-// === List Cards ===
 app.get("/api/v1/cards", async (req, res) => {
   try {
     const mem = await getMemory();
@@ -159,7 +149,6 @@ app.get("/api/v1/cards", async (req, res) => {
   }
 });
 
-// === Delete Card ===
 app.delete("/api/v1/cards/:id", async (req, res) => {
   try {
     const mem = await getMemory();
@@ -170,7 +159,6 @@ app.delete("/api/v1/cards/:id", async (req, res) => {
   }
 });
 
-// === Reset ===
 app.post("/api/v1/reset", async (_req, res) => {
   try {
     const mem = await getMemory();
@@ -181,7 +169,6 @@ app.post("/api/v1/reset", async (_req, res) => {
   }
 });
 
-// === Rebuild Index ===
 app.post("/api/v1/rebuild-index", async (_req, res) => {
   try {
     const mem = await getMemory();
@@ -192,7 +179,18 @@ app.post("/api/v1/rebuild-index", async (_req, res) => {
   }
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`🃏 Memory Card API running at http://${HOST}:${PORT}`);
+const server = app.listen(PORT, HOST, () => {
+  console.log(`Memory Card API running at http://${HOST}:${PORT}`);
   console.log(`   Health: http://localhost:${PORT}/api/v1/health`);
 });
+
+function shutdown() {
+  console.log("Shutting down...");
+  if (memory) {
+    memory.close().catch((err) => console.error("Error closing memory:", err));
+  }
+  server.close(() => process.exit(0));
+}
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);

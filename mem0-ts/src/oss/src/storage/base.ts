@@ -9,6 +9,8 @@ export interface HistoryEntry {
 export interface HistoryManager {
   addHistory(entry: HistoryEntry): Promise<void>;
   getHistory(cardId: string): Promise<HistoryEntry[]>;
+  getSessionCounter?(scope: string): Promise<number>;
+  incrementSessionCounter?(scope: string): Promise<number>;
   reset(): Promise<void>;
   close(): void;
 }

@@ -1,6 +1,13 @@
 import { SearchFilters } from "../types";
 import { MemoryCard } from "../types";
 
+export interface ReinforceEntry {
+  id: string;
+  accessCount: number;
+  lastAccessedSession: number;
+  recentAccessSessions: number[];
+}
+
 export interface VectorStore {
   insert(cards: MemoryCard[]): Promise<void>;
   search(
@@ -18,4 +25,7 @@ export interface VectorStore {
   deleteAll(filters?: SearchFilters): Promise<void>;
   rebuildIndex(): Promise<void>;
   initialize(): Promise<void>;
+  reinforceBatch?(entries: ReinforceEntry[]): Promise<void>;
+  batchUpdateStatus?(ids: string[], status: string, updatedAt: string): Promise<void>;
+  close?(): Promise<void>;
 }

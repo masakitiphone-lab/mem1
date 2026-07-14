@@ -1,12 +1,6 @@
 import { Embedder } from "./base";
 import { EmbeddingConfig } from "../types";
 
-// FastEmbed only ships a fixed set of ONNX models (fastembed's `EmbeddingModel`
-// enum, minus CUSTOM). Mirrored here as literals so an invalid model name can
-// be rejected synchronously in the constructor — with a clear message instead
-// of a `FlagEmbedding.init()` download error — without eagerly importing the
-// optional 'fastembed' package just to read its enum. Keep in sync if
-// fastembed adds a model.
 const SUPPORTED_MODELS = [
   "fast-all-MiniLM-L6-v2",
   "fast-bge-base-en",
@@ -51,8 +45,8 @@ export class FastEmbedEmbedder implements Embedder {
   private async initEmbeddingModel(): Promise<any> {
     let sdk: any;
     try {
-      // @ts-ignore - fastembed is optional peer dep
-      sdk = await import("fastembed");
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      sdk = require("fastembed");
     } catch {
       throw new Error(
         "The 'fastembed' package is required to use the FastEmbed embedder. Install it with: npm install fastembed",
@@ -69,15 +63,21 @@ export class FastEmbedEmbedder implements Embedder {
   async embed(text: string): Promise<number[]> {
     const normalizedText = this.normalizeInput(text);
     const model = await this.getEmbeddingModel();
+    const allEmbeddings: number[][] = [];
 
     for await (const batch of model.embed([normalizedText])) {
-      const embedding = batch[0];
-      if (embedding !== undefined) {
-        return embedding;
+      for (const emb of batch) {
+        if (emb !== undefined) {
+          allEmbeddings.push(emb);
+        }
       }
     }
 
-    throw new Error("FastEmbed embed() returned no embeddings");
+    if (allEmbeddings.length === 0) {
+      throw new Error("FastEmbed embed() returned no embeddings");
+    }
+
+    return allEmbeddings[0];
   }
 
   async embedBatch(texts: string[]): Promise<number[][]> {

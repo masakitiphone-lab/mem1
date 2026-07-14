@@ -19,7 +19,7 @@ export const DEFAULT_MEMORY_CONFIG: MemoryConfig = {
     provider: "google",
     config: {
       model: "gemini-2.0-flash",
-      apiKey: process.env.GEMINI_API_KEY || "",
+      apiKey: "",
     },
   },
   historyStore: {

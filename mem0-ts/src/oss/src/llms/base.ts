@@ -9,11 +9,19 @@ export interface LLMResponse {
   }>;
 }
 
+export interface ToolDef {
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
 export interface LLM {
   generateResponse(
     messages: Array<{ role: string; content: string }>,
     response_format?: { type: string },
-    tools?: any[],
+    tools?: ToolDef[],
   ): Promise<any>;
   generateChat(messages: Message[]): Promise<LLMResponse>;
 }

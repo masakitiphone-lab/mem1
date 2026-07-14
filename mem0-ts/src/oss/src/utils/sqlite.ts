@@ -11,5 +11,11 @@ export function ensureSQLiteDirectory(dbPath: string): void {
     return;
   }
 
-  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  try {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  } catch (error: any) {
+    throw new Error(
+      `Failed to create directory for SQLite database at "${dbPath}": ${error.message}`,
+    );
+  }
 }

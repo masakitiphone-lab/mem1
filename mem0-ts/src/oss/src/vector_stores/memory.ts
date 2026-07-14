@@ -1,25 +1,29 @@
 import Database from "better-sqlite3";
-import fs from "fs";
 import path from "path";
-import { VectorStore } from "./base";
+import { VectorStore, ReinforceEntry } from "./base";
 import { MemoryCard, SearchFilters, VectorStoreConfig } from "../types";
 import {
   ensureSQLiteDirectory,
   getDefaultVectorStoreDbPath,
 } from "../utils/sqlite";
 
-interface IndexEntry {
-  id: string;
-  vector: Float32Array;
+const OVERFETCH_MULTIPLIER = 3;
+
+function tryLoadVec(db: Database.Database): boolean {
+  try {
+    const sqliteVec = require("sqlite-vec");
+    sqliteVec.load(db);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export class MemoryVectorStore implements VectorStore {
   private db: Database.Database;
   private dimension: number;
   private dbPath: string;
-
-  private index: IndexEntry[] = [];
-  private indexLoaded = false;
+  private hasVec: boolean;
 
   constructor(config: VectorStoreConfig) {
     this.dimension = config.dimension || 384;
@@ -27,6 +31,7 @@ export class MemoryVectorStore implements VectorStore {
     ensureSQLiteDirectory(this.dbPath);
     this.db = new Database(this.dbPath);
     this.db.pragma("journal_mode = WAL");
+    this.hasVec = tryLoadVec(this.db);
     this.init();
   }
 
@@ -62,47 +67,23 @@ export class MemoryVectorStore implements VectorStore {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status)
     `);
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS vectors (
-        id TEXT PRIMARY KEY,
-        vector BLOB NOT NULL,
-        FOREIGN KEY (id) REFERENCES cards(id)
-      )
-    `);
-  }
 
-  private loadIndex(): void {
-    if (this.indexLoaded) return;
-    const rows = this.db
-      .prepare("SELECT id, vector FROM vectors")
-      .all() as Array<{ id: string; vector: Buffer }>;
-    this.index = rows.map((row) => ({
-      id: row.id,
-      vector: new Float32Array(
-        row.vector.buffer,
-        row.vector.byteOffset,
-        row.vector.byteLength / 4,
-      ),
-    }));
-    this.indexLoaded = true;
-  }
-
-  private invalidateIndex(): void {
-    this.indexLoaded = false;
-    this.index = [];
-  }
-
-  private cosineSimilarity(a: Float32Array, b: number[]): number {
-    let dot = 0;
-    let normA = 0;
-    let normB = 0;
-    for (let i = 0; i < a.length; i++) {
-      dot += a[i] * b[i];
-      normA += a[i] * a[i];
-      normB += b[i] * b[i];
+    if (this.hasVec) {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS vec0 USING vec0(
+          id TEXT PRIMARY KEY,
+          vector FLOAT[${this.dimension}] distance_metric=cosine
+        )
+      `);
+    } else {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS vectors (
+          id TEXT PRIMARY KEY,
+          vector BLOB NOT NULL,
+          FOREIGN KEY (id) REFERENCES cards(id) ON DELETE CASCADE
+        )
+      `);
     }
-    const denom = Math.sqrt(normA) * Math.sqrt(normB);
-    return denom === 0 ? 0 : dot / denom;
   }
 
   private cardFromRow(row: any): MemoryCard {
@@ -151,6 +132,111 @@ export class MemoryVectorStore implements VectorStore {
     return { where: clauses.join(" AND "), params };
   }
 
+  // ---- Brute-force fallback (when sqlite-vec unavailable) ----
+
+  private loadAllVectors(): Array<{ id: string; vector: Float32Array }> {
+    const rows = this.db
+      .prepare("SELECT id, vector FROM vectors")
+      .all() as Array<{ id: string; vector: Buffer }>;
+    return rows.map((row) => ({
+      id: row.id,
+      vector: new Float32Array(
+        row.vector.buffer,
+        row.vector.byteOffset,
+        row.vector.byteLength / 4,
+      ),
+    }));
+  }
+
+  private cosineSimilarity(a: Float32Array, b: number[]): number {
+    let dot = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    const denom = Math.sqrt(normA) * Math.sqrt(normB);
+    return denom === 0 ? 0 : dot / denom;
+  }
+
+  private async searchBruteForce(
+    queryVector: number[],
+    topK: number,
+    filters?: SearchFilters,
+  ): Promise<Array<{ id: string; score: number; card: MemoryCard }>> {
+    const allVecs = this.loadAllVectors();
+    const { where, params } = this.buildWhereClause(filters);
+    const rows = this.db
+      .prepare(`SELECT * FROM cards WHERE ${where}`)
+      .all(...params) as any[];
+
+    const filteredIds = new Set(rows.map((r) => r.id));
+    const scored: Array<{ id: string; score: number }> = [];
+
+    for (const entry of allVecs) {
+      if (!filteredIds.has(entry.id)) continue;
+      const score = this.cosineSimilarity(entry.vector, queryVector);
+      scored.push({ id: entry.id, score });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    const top = scored.slice(0, topK);
+
+    const cardMap = new Map(rows.map((r) => [r.id, r]));
+    return top.map((s) => ({
+      id: s.id,
+      score: s.score,
+      card: this.cardFromRow(cardMap.get(s.id)),
+    }));
+  }
+
+  // ---- sqlite-vec ANN search ----
+
+  private async searchVec(
+    queryVector: number[],
+    topK: number,
+    filters?: SearchFilters,
+  ): Promise<Array<{ id: string; score: number; card: MemoryCard }>> {
+    const queryBuf = Buffer.from(new Float32Array(queryVector).buffer);
+    const vecK = topK * OVERFETCH_MULTIPLIER;
+
+    const vecResults = this.db
+      .prepare("SELECT id, distance FROM vec0 WHERE vector MATCH ? AND k = ?")
+      .all(queryBuf, vecK) as Array<{ id: string; distance: number }>;
+
+    if (vecResults.length === 0) return [];
+
+    const scored = vecResults.map((r) => ({
+      id: r.id,
+      score: 1 - r.distance,
+    }));
+
+    const { where, params } = this.buildWhereClause(filters);
+    const ids = scored.map((s) => s.id);
+    const placeholders = ids.map(() => "?").join(",");
+    const cardRows = this.db
+      .prepare(
+        `SELECT * FROM cards WHERE id IN (${placeholders}) AND ${where}`,
+      )
+      .all(...ids, ...params) as any[];
+
+    const filteredIds = new Set(cardRows.map((r) => r.id));
+    const scoreMap = new Map(scored.map((s) => [s.id, s.score]));
+
+    return cardRows
+      .map((row) => ({
+        id: row.id,
+        score: scoreMap.get(row.id) ?? 0,
+        card: this.cardFromRow(row),
+      }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, topK);
+  }
+
+  // ---- Public API ----
+
   async insert(cards: MemoryCard[]): Promise<void> {
     const insertCard = this.db.prepare(`
       INSERT OR REPLACE INTO cards
@@ -162,12 +248,24 @@ export class MemoryVectorStore implements VectorStore {
       VALUES
         (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    const insertVector = this.db.prepare(
-      "INSERT OR REPLACE INTO vectors (id, vector) VALUES (?, ?)",
-    );
+    const insertVec = !this.hasVec
+      ? this.db.prepare(
+          "INSERT OR REPLACE INTO vectors (id, vector) VALUES (?, ?)",
+        )
+      : null;
+    const insertVec0 = this.hasVec
+      ? this.db.prepare(
+          "INSERT OR REPLACE INTO vec0(id, vector) VALUES (?, ?)",
+        )
+      : null;
 
     const txn = this.db.transaction(() => {
       for (const card of cards) {
+        if (card.vector && card.vector.length !== this.dimension) {
+          throw new Error(
+            `Vector dimension mismatch: expected ${this.dimension}, got ${card.vector.length}`,
+          );
+        }
         insertCard.run(
           card.id,
           card.text,
@@ -193,12 +291,15 @@ export class MemoryVectorStore implements VectorStore {
         );
         if (card.vector) {
           const buf = Buffer.from(new Float32Array(card.vector).buffer);
-          insertVector.run(card.id, buf);
+          if (insertVec0) {
+            insertVec0.run(card.id, buf);
+          } else if (insertVec) {
+            insertVec.run(card.id, buf);
+          }
         }
       }
     });
     txn();
-    this.invalidateIndex();
   }
 
   async search(
@@ -206,39 +307,10 @@ export class MemoryVectorStore implements VectorStore {
     topK: number,
     filters?: SearchFilters,
   ): Promise<Array<{ id: string; score: number; card: MemoryCard }>> {
-    this.loadIndex();
-
-    const { where, params } = this.buildWhereClause(filters);
-    const rows = this.db
-      .prepare(`SELECT * FROM cards WHERE ${where}`)
-      .all(...params) as any[];
-
-    const filteredIds = new Set(rows.map((r) => r.id));
-
-    const scored: Array<{
-      id: string;
-      score: number;
-      vector: Float32Array;
-    }> = [];
-    for (const entry of this.index) {
-      if (!filteredIds.has(entry.id)) continue;
-      const score = this.cosineSimilarity(entry.vector, queryVector);
-      scored.push({ id: entry.id, score, vector: entry.vector });
+    if (this.hasVec) {
+      return this.searchVec(queryVector, topK, filters);
     }
-
-    scored.sort((a, b) => b.score - a.score);
-    const top = scored.slice(0, topK);
-
-    const cardMap = new Map<string, any>();
-    for (const row of rows) {
-      cardMap.set(row.id, row);
-    }
-
-    return top.map((s) => ({
-      id: s.id,
-      score: s.score,
-      card: this.cardFromRow(cardMap.get(s.id)),
-    }));
+    return this.searchBruteForce(queryVector, topK, filters);
   }
 
   async get(id: string): Promise<MemoryCard | null> {
@@ -292,17 +364,32 @@ export class MemoryVectorStore implements VectorStore {
 
     if (updates.vector) {
       const buf = Buffer.from(new Float32Array(updates.vector).buffer);
-      this.db
-        .prepare("UPDATE vectors SET vector = ? WHERE id = ?")
-        .run(buf, id);
+      if (this.hasVec) {
+        const txn = this.db.transaction(() => {
+          this.db.prepare("DELETE FROM vec0 WHERE id = ?").run(id);
+          this.db
+            .prepare("INSERT INTO vec0(id, vector) VALUES (?, ?)")
+            .run(id, buf);
+        });
+        txn();
+      } else {
+        this.db
+          .prepare("UPDATE vectors SET vector = ? WHERE id = ?")
+          .run(buf, id);
+      }
     }
-    this.invalidateIndex();
   }
 
   async delete(id: string): Promise<void> {
-    this.db.prepare("DELETE FROM cards WHERE id = ?").run(id);
-    this.db.prepare("DELETE FROM vectors WHERE id = ?").run(id);
-    this.invalidateIndex();
+    const txn = this.db.transaction(() => {
+      if (this.hasVec) {
+        this.db.prepare("DELETE FROM vec0 WHERE id = ?").run(id);
+      } else {
+        this.db.prepare("DELETE FROM vectors WHERE id = ?").run(id);
+      }
+      this.db.prepare("DELETE FROM cards WHERE id = ?").run(id);
+    });
+    txn();
   }
 
   async list(
@@ -310,22 +397,91 @@ export class MemoryVectorStore implements VectorStore {
     topK: number = 100,
   ): Promise<[MemoryCard[], number]> {
     const { where, params } = this.buildWhereClause(filters);
+
+    const totalRow = this.db
+      .prepare(`SELECT COUNT(*) as count FROM cards WHERE ${where}`)
+      .get(...params) as { count: number };
+    const total = totalRow?.count ?? 0;
+
+    if (topK <= 0) {
+      return [[], total];
+    }
+
     const rows = this.db
       .prepare(`SELECT * FROM cards WHERE ${where} LIMIT ?`)
       .all(...params, topK) as any[];
-    return [rows.map((r) => this.cardFromRow(r)), rows.length];
+    return [rows.map((r) => this.cardFromRow(r)), total];
   }
 
   async deleteAll(filters?: SearchFilters): Promise<void> {
-    const { where, params } = this.buildWhereClause(filters);
-    this.db.prepare(`DELETE FROM cards WHERE ${where}`).run(...params);
-    this.db.prepare(`DELETE FROM vectors WHERE id NOT IN (SELECT id FROM cards)`).run();
-    this.invalidateIndex();
+    const txn = this.db.transaction(() => {
+      if (filters?.user_id || filters?.agent_id || filters?.run_id) {
+        const { where, params } = this.buildWhereClause(filters);
+        const vecTable = this.hasVec ? "vec0" : "vectors";
+        this.db.prepare(
+          `DELETE FROM ${vecTable} WHERE id IN (SELECT id FROM cards WHERE ${where})`,
+        ).run(...params);
+        this.db.prepare(`DELETE FROM cards WHERE ${where}`).run(...params);
+      } else {
+        if (this.hasVec) {
+          this.db.exec("DELETE FROM vec0");
+        } else {
+          this.db.exec("DELETE FROM vectors");
+        }
+        this.db.exec("DELETE FROM cards");
+      }
+    });
+    txn();
+  }
+
+  async batchUpdateStatus(
+    ids: string[],
+    status: string,
+    updatedAt: string,
+  ): Promise<void> {
+    if (ids.length === 0) return;
+    const stmt = this.db.prepare(
+      "UPDATE cards SET status = ?, updated_at = ? WHERE id = ?",
+    );
+    const txn = this.db.transaction(() => {
+      for (const id of ids) {
+        stmt.run(status, updatedAt, id);
+      }
+    });
+    txn();
+  }
+
+  async reinforceBatch(entries: ReinforceEntry[]): Promise<void> {
+    const updateStmt = this.db.prepare(`
+      UPDATE cards SET
+        access_count = ?,
+        last_accessed_session = ?,
+        last_reinforced_session = ?,
+        recent_access_sessions = ?,
+        updated_at = ?
+      WHERE id = ?
+    `);
+    const now = new Date().toISOString();
+
+    const txn = this.db.transaction(() => {
+      for (const entry of entries) {
+        updateStmt.run(
+          entry.accessCount,
+          entry.lastAccessedSession,
+          entry.lastAccessedSession,
+          JSON.stringify(entry.recentAccessSessions),
+          now,
+          entry.id,
+        );
+      }
+    });
+    txn();
   }
 
   async rebuildIndex(): Promise<void> {
-    this.invalidateIndex();
-    this.loadIndex();
+    // vec0 manages the index automatically.
+    // For the brute-force fallback, vectors are always read fresh from DB.
+    // Nothing to rebuild.
   }
 
   async initialize(): Promise<void> {
@@ -333,6 +489,7 @@ export class MemoryVectorStore implements VectorStore {
   }
 
   async close(): Promise<void> {
+    this.db.pragma("wal_checkpoint(TRUNCATE)");
     this.db.close();
   }
 }

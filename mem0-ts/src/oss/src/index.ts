@@ -1,10 +1,12 @@
 export { Memory } from "./memory";
 export type { SearchOptions, ConsolidateOptions, ReinforceOptions, ArchiveOptions, SearchMetrics, ConsolidateResult } from "./memory/memory.types";
-export type { MemoryCard, MemoryConfig, SearchResult, SearchFilters, EmbeddingConfig } from "./types";
+export type { MemoryCard, MemoryConfig, SearchResult, SearchFilters, EmbeddingConfig, LLMConfig, VectorStoreConfig } from "./types";
 export type { Embedder } from "./embeddings/base";
 export { FastEmbedEmbedder } from "./embeddings/fastembed";
-export type { LLM } from "./llms/base";
+export type { LLM, LLMResponse } from "./llms/base";
 export { GoogleLLM } from "./llms/google";
-export { MemoryVectorStore } from "./vector_stores/memory";
+export type { Reranker } from "./rerankers/base";
 export { ActrReranker } from "./rerankers/actr";
+export { MemoryVectorStore } from "./vector_stores/memory";
 export { SQLiteManager } from "./storage/SQLiteManager";
+export { ConfigManager } from "./config/manager";

@@ -5,7 +5,6 @@ import {
   MemoryCard,
   Message,
   SearchFilters,
-  SearchResult,
 } from "../types";
 import {
   EmbedderFactory,
@@ -15,10 +14,10 @@ import {
 } from "../utils/factory";
 import { Embedder } from "../embeddings/base";
 import { LLM } from "../llms/base";
-import { VectorStore } from "../vector_stores/base";
+import { VectorStore, ReinforceEntry } from "../vector_stores/base";
 import { HistoryManager } from "../storage/base";
-import { SQLiteManager } from "../storage/SQLiteManager";
 import { ConfigManager } from "../config/manager";
+import { Reranker } from "../rerankers/base";
 import { ActrReranker } from "../rerankers/actr";
 import { CONSOLIDATE_SYSTEM_PROMPT, buildConsolidationPrompt } from "../prompts";
 import {
@@ -36,6 +35,11 @@ const DEFAULT_BASE_STRENGTH = 1.0;
 const MIN_STRENGTH = 0.05;
 const LOW_CONFIDENCE = 0.55;
 const MED_CONFIDENCE = 0.80;
+const MAX_RECENT_ACCESS = 20;
+
+function hashContent(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
 
 export class Memory {
   private config: MemoryConfig;
@@ -43,15 +47,17 @@ export class Memory {
   private vectorStore: VectorStore;
   private llm: LLM;
   private db: HistoryManager;
-  private reranker: ActrReranker;
+  private reranker: Reranker;
 
   private sessionCounter: number = 0;
-  private sessionScope: string = "";
   private sessionInterval: number;
   private lastMetrics: SearchMetrics | null = null;
   private _initPromise: Promise<void>;
 
-  constructor(config: Partial<MemoryConfig> = {}) {
+  constructor(
+    config: Partial<MemoryConfig> = {},
+    reranker?: Reranker,
+  ) {
     this.config = ConfigManager.mergeConfig(config);
 
     this.embedder = EmbedderFactory.create(
@@ -70,9 +76,9 @@ export class Memory {
     if (this.config.disableHistory) {
       this.db = new (class implements HistoryManager {
         async addHistory() {}
-        async getHistory() {
-          return [];
-        }
+        async getHistory() { return []; }
+        async getSessionCounter() { return 0; }
+        async incrementSessionCounter() { return 0; }
         async reset() {}
         close() {}
       })();
@@ -85,17 +91,16 @@ export class Memory {
 
     this.sessionInterval =
       this.config.sessionInterval ?? DEFAULT_INTERVAL;
-    this.reranker = new ActrReranker({}, 0);
+    this.reranker = reranker ?? new ActrReranker({}, 0);
 
-    this._initPromise = this._initialize();
+    this._initPromise = this._initialize().catch((error) => {
+      console.error("Memory initialization failed:", error);
+      throw error;
+    });
   }
 
   private async _initialize(): Promise<void> {
     await this.vectorStore.initialize();
-    if (!this.config.vectorStore.config.dimension) {
-      const probe = await this.embedder.embed("dimension probe");
-      (this.config.vectorStore.config as any).dimension = probe.length;
-    }
   }
 
   private async _ensureInitialized(): Promise<void> {
@@ -110,11 +115,9 @@ export class Memory {
     return this.sessionCounter;
   }
 
-  /**
-   * 検索（LLM不使用）
-   * Embedding → Vector Search → ACT-R+Fadeリランク → 強化
-   * 目標: totalMs < 500
-   */
+  /** Search memory cards by semantic similarity.
+   *  Embedding -> Vector Search -> ACT-R+Fade rerank -> reinforce seen cards.
+   *  No LLM used. Target latency: <500ms. */
   async search(
     query: string,
     options: SearchOptions = { query },
@@ -129,12 +132,10 @@ export class Memory {
       threshold = 0.0,
     } = options;
 
-    // 1. Embedding
     const embedStart = Date.now();
     const queryVector = await this.embedder.embed(query, "search");
     const embeddingMs = Date.now() - embedStart;
 
-    // 2. Vector search (over-fetch)
     const searchStart = Date.now();
     const rawResults = await this.vectorStore.search(
       queryVector,
@@ -143,9 +144,8 @@ export class Memory {
     );
     const vectorSearchMs = Date.now() - searchStart;
 
-    // 3. ACT-R + Fade rerank
     const rerankStart = Date.now();
-    this.reranker.setCurrentSession(this.sessionCounter);
+    this.reranker.setCurrentSession?.(this.sessionCounter);
     const reranked = await this.reranker.rerank(
       query,
       rawResults.map((r) => ({
@@ -165,19 +165,18 @@ export class Memory {
     );
     const rerankMs = Date.now() - rerankStart;
 
-    // 4. Reinforce cards that made it to final results
     const reinforceStart = Date.now();
     const finalIds = reranked.map((r) => r.id);
     await this.reinforceInternal(finalIds);
     const reinforceMs = Date.now() - reinforceStart;
 
-    // Map back to MemoryCard objects
     const idToCard = new Map(rawResults.map((r) => [r.id, r.card]));
     const results = reranked
       .filter((r) => (r.score ?? 0) >= threshold)
-      .map((r) => ({
-        ...idToCard.get(r.id)!,
-      }));
+      .flatMap((r) => {
+        const card = idToCard.get(r.id);
+        return card ? [{ ...card }] : [];
+      });
 
     const totalMs = Date.now() - totalStart;
     this.lastMetrics = {
@@ -191,10 +190,8 @@ export class Memory {
     return { results, metrics: this.lastMetrics };
   }
 
-  /**
-   * 記憶整理（LLM使用）
-   * 会話から ADD / UPDATE / MERGE / IGNORE を判断
-   */
+  /** Consolidate conversation into memory cards using LLM.
+   *  Analyzes messages and decides ADD / UPDATE / MERGE / IGNORE operations. */
   async consolidate(
     options: ConsolidateOptions,
   ): Promise<ConsolidateResult> {
@@ -206,7 +203,6 @@ export class Memory {
     if (agentId) filters.agent_id = agentId;
     if (runId) filters.run_id = runId;
 
-    // Existing cards for context
     const [existingCards] = await this.vectorStore.list(filters, 20);
 
     const conversationText = messages
@@ -227,12 +223,15 @@ export class Memory {
         ],
         { type: "json_object" },
       )) as string;
-    } catch (e) {
-      console.error("Consolidation LLM failed:", e);
-      return { operations: [], archivedCount: 0, sessionCounter: this.sessionCounter };
+    } catch (e: any) {
+      return {
+        operations: [],
+        archivedCount: 0,
+        sessionCounter: this.sessionCounter,
+        error: `LLM consolidation failed: ${e.message}`,
+      };
     }
 
-    // Parse response
     let operations: Array<{
       action: string;
       text?: string;
@@ -246,15 +245,18 @@ export class Memory {
     }> = [];
 
     try {
-      const cleaned = response.replace(/^```json\n?/, "").replace(/\n```$/, "").trim();
+      const cleaned = response.replace(/^```(?:json)?\n?/, "").replace(/\n```$/, "").trim();
       const parsed = JSON.parse(cleaned);
       operations = parsed.operations || parsed.memory || [];
     } catch {
-      console.error("Failed to parse consolidation response:", response);
-      return { operations: [], archivedCount: 0, sessionCounter: this.sessionCounter };
+      return {
+        operations: [],
+        archivedCount: 0,
+        sessionCounter: this.sessionCounter,
+        error: `Failed to parse consolidation response: ${response.slice(0, 200)}`,
+      };
     }
 
-    // Validate operations
     const validTargets = new Set(existingCards.map((c) => c.id));
     const executed: ConsolidateResult["operations"] = [];
 
@@ -264,16 +266,13 @@ export class Memory {
       const confidence = op.confidence ?? 0;
 
       if (action === "IGNORE" || !text) continue;
-
-      // Validate confidence
       if (confidence < LOW_CONFIDENCE) continue;
 
       if (action === "UPDATE" || action === "MERGE") {
         if (!op.target_id || !validTargets.has(op.target_id)) {
-          // Target not found, fall back to ADD
           await this.addCard({
             text,
-            memoryType: op.memory_type as any,
+            memoryType: op.memory_type as "episode" | "state" | "preference" | undefined,
             subject: op.subject,
             property: op.property,
             valueNumber: op.valueNumber,
@@ -286,10 +285,9 @@ export class Memory {
         }
 
         if (confidence < MED_CONFIDENCE) {
-          // Low confidence for UPDATE/MERGE → ADD instead
           const cardId = await this.addCard({
             text,
-            memoryType: op.memory_type as any,
+            memoryType: op.memory_type as "episode" | "state" | "preference" | undefined,
             subject: op.subject,
             property: op.property,
             valueNumber: op.valueNumber,
@@ -305,14 +303,13 @@ export class Memory {
         if (!existing) continue;
 
         const mergedText =
-          action === "MERGE" ? `${existing.text}。${text}` : text;
-
-        const hash = createHash("md5").update(mergedText).digest("hex");
+          action === "MERGE" ? `${existing.text} - ${text}` : text;
+        const hash = hashContent(mergedText);
 
         await this.vectorStore.update(op.target_id, {
           text: mergedText,
           hash,
-          memoryType: (op.memory_type as any) || existing.memoryType,
+          memoryType: (op.memory_type as "episode" | "state" | "preference" | undefined) || existing.memoryType,
           subject: op.subject || existing.subject,
           property: op.property || existing.property,
           valueNumber: op.valueNumber ?? existing.valueNumber,
@@ -322,7 +319,7 @@ export class Memory {
 
         await this.db.addHistory({
           cardId: op.target_id,
-          action: action as any,
+          action: action as "UPDATE" | "MERGE",
           previousText: existing.text,
           newText: mergedText,
           createdAt: new Date().toISOString(),
@@ -330,10 +327,9 @@ export class Memory {
 
         executed.push({ action, cardId: op.target_id, text, confidence });
       } else {
-        // ADD
         const cardId = await this.addCard({
           text,
-          memoryType: op.memory_type as any,
+          memoryType: op.memory_type as "episode" | "state" | "preference" | undefined,
           subject: op.subject,
           property: op.property,
           valueNumber: op.valueNumber,
@@ -345,7 +341,6 @@ export class Memory {
       }
     }
 
-    // Archive faded cards
     const archivedCount = await this.archiveFadedInternal();
 
     return {
@@ -355,9 +350,6 @@ export class Memory {
     };
   }
 
-  /**
-   * Add a single memory card
-   */
   private async addCard(params: {
     text: string;
     memoryType?: "episode" | "state" | "preference";
@@ -368,11 +360,10 @@ export class Memory {
     filters: SearchFilters;
     confidence: number;
   }): Promise<string> {
-    const { text, memoryType, subject, property, valueNumber, unit, filters } =
-      params;
+    const { text, memoryType, subject, property, valueNumber, unit, filters } = params;
 
     const vector = await this.embedder.embed(text, "add");
-    const hash = createHash("md5").update(text).digest("hex");
+    const hash = hashContent(text);
     const now = new Date().toISOString();
     const cardId = uuidv4();
 
@@ -414,9 +405,7 @@ export class Memory {
     return cardId;
   }
 
-  /**
-   * セッション追加＋自動整理トリガー
-   */
+  /** Increment session counter. If interval is reached, triggers auto-consolidation. */
   async addSession(
     scope: string = "default",
     messages?: Array<{ role: string; content: string }>,
@@ -425,14 +414,13 @@ export class Memory {
     consolidated: ConsolidateResult | null;
   }> {
     await this._ensureInitialized();
-    this.sessionScope = scope;
 
-    if (this.db instanceof SQLiteManager) {
+    if (this.db.incrementSessionCounter) {
       this.sessionCounter = await this.db.incrementSessionCounter(scope);
     } else {
       this.sessionCounter++;
     }
-    this.reranker.setCurrentSession(this.sessionCounter);
+    this.reranker.setCurrentSession?.(this.sessionCounter);
 
     let consolidated: ConsolidateResult | null = null;
     if (
@@ -447,17 +435,41 @@ export class Memory {
     return { sessionCounter: this.sessionCounter, consolidated };
   }
 
-  /**
-   * 内部強化処理
-   */
   private async reinforceInternal(cardIds: string[]): Promise<void> {
+    if (this.vectorStore.reinforceBatch) {
+      const entries: ReinforceEntry[] = [];
+      for (const id of cardIds) {
+        const card = await this.vectorStore.get(id);
+        if (!card) continue;
+
+        const recentAccess = [...(card.recentAccessSessions || [])];
+        recentAccess.push(this.sessionCounter);
+        if (recentAccess.length > MAX_RECENT_ACCESS) {
+          recentAccess.splice(0, recentAccess.length - MAX_RECENT_ACCESS);
+        }
+
+        entries.push({
+          id,
+          accessCount: (card.accessCount || 0) + 1,
+          lastAccessedSession: this.sessionCounter,
+          recentAccessSessions: recentAccess,
+        });
+      }
+      if (entries.length > 0) {
+        await this.vectorStore.reinforceBatch(entries);
+      }
+      return;
+    }
+
     for (const id of cardIds) {
       const card = await this.vectorStore.get(id);
       if (!card) continue;
 
       const recentAccess = [...(card.recentAccessSessions || [])];
       recentAccess.push(this.sessionCounter);
-      if (recentAccess.length > 5) recentAccess.shift();
+      if (recentAccess.length > MAX_RECENT_ACCESS) {
+        recentAccess.splice(0, recentAccess.length - MAX_RECENT_ACCESS);
+      }
 
       await this.vectorStore.update(id, {
         accessCount: (card.accessCount || 0) + 1,
@@ -469,9 +481,7 @@ export class Memory {
     }
   }
 
-  /**
-   * 外部強化API
-   */
+  /** Manually reinforce (boost) specific cards. */
   async reinforce(cardIds: string[], session?: number): Promise<void> {
     await this._ensureInitialized();
     if (session !== undefined) {
@@ -484,60 +494,68 @@ export class Memory {
     }
   }
 
-  /**
-   * 内部Fade整理
-   */
   private async archiveFadedInternal(
     threshold: number = MIN_STRENGTH,
   ): Promise<number> {
     const [cards] = await this.vectorStore.list({}, 10000);
-    let archived = 0;
+    const toArchive: string[] = [];
+    const toDelete: string[] = [];
+    const now = new Date().toISOString();
 
     for (const card of cards) {
       const elapsed = Math.max(
-        this.sessionCounter - card.lastReinforcedSession,
-        0,
+        this.sessionCounter - card.lastReinforcedSession, 0,
       );
-      const halfLife = card.halfLifeSessions || DEFAULT_HALF_LIFE_SESSIONS;
+      const halfLife =
+        card.halfLifeSessions != null && card.halfLifeSessions > 0
+          ? card.halfLifeSessions
+          : DEFAULT_HALF_LIFE_SESSIONS;
       const strength =
         card.baseStrength * Math.pow(2, -elapsed / halfLife);
 
       if (strength < threshold && card.status === "active") {
-        await this.vectorStore.update(card.id, {
-          status: "archived",
-          updatedAt: new Date().toISOString(),
-        });
+        toArchive.push(card.id);
         await this.db.addHistory({
           cardId: card.id,
           action: "ARCHIVE",
           previousText: card.text,
           newText: null,
-          createdAt: new Date().toISOString(),
+          createdAt: now,
         });
-        archived++;
       }
 
       if (strength < threshold * 0.1 && card.status === "archived") {
-        await this.vectorStore.update(card.id, {
-          status: "deleted",
-          updatedAt: new Date().toISOString(),
-        });
+        toDelete.push(card.id);
         await this.db.addHistory({
           cardId: card.id,
           action: "DELETE",
           previousText: card.text,
           newText: null,
-          createdAt: new Date().toISOString(),
+          createdAt: now,
         });
       }
     }
 
-    return archived;
+    if (this.vectorStore.batchUpdateStatus) {
+      if (toArchive.length > 0) {
+        await this.vectorStore.batchUpdateStatus(toArchive, "archived", now);
+      }
+      if (toDelete.length > 0) {
+        await this.vectorStore.batchUpdateStatus(toDelete, "deleted", now);
+      }
+    } else {
+      for (const id of toArchive) {
+        await this.vectorStore.update(id, { status: "archived", updatedAt: now });
+      }
+      for (const id of toDelete) {
+        await this.vectorStore.update(id, { status: "deleted", updatedAt: now });
+      }
+    }
+
+    return toArchive.length + toDelete.length;
   }
 
-  /**
-   * 外部Fade整理API
-   */
+  /** Archive faded cards and delete fully decayed ones. */
   async archiveFaded(
     options: ArchiveOptions = {},
   ): Promise<{ archivedCount: number }> {
@@ -550,11 +568,13 @@ export class Memory {
 
   // ===== CRUD =====
 
+  /** Get a single card by ID. */
   async get(id: string): Promise<MemoryCard | null> {
     await this._ensureInitialized();
     return this.vectorStore.get(id);
   }
 
+  /** List all active cards with optional filters. */
   async getAll(
     filters?: SearchFilters,
     topK: number = 100,
@@ -564,6 +584,7 @@ export class Memory {
     return { results, total };
   }
 
+  /** Delete a card permanently. */
   async delete(id: string): Promise<void> {
     await this._ensureInitialized();
     const card = await this.vectorStore.get(id);
@@ -579,6 +600,7 @@ export class Memory {
     await this.vectorStore.delete(id);
   }
 
+  /** Reset all data and session counter. */
   async reset(): Promise<void> {
     await this._ensureInitialized();
     await this.vectorStore.deleteAll();
@@ -586,8 +608,15 @@ export class Memory {
     this.sessionCounter = 0;
   }
 
+  /** Rebuild the in-memory vector index from SQLite. */
   async rebuildIndex(): Promise<void> {
     await this._ensureInitialized();
     await this.vectorStore.rebuildIndex();
+  }
+
+  /** Close all database connections. */
+  async close(): Promise<void> {
+    await this.vectorStore.close?.();
+    this.db.close();
   }
 }

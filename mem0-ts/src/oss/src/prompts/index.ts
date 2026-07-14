@@ -6,8 +6,8 @@ You must output a JSON array of operations to perform.
 
 Available operations:
 - ADD: Create a new memory card for new information
-- UPDATE: Replace the content of an existing card (when values change, e.g. "週2回走っている" → "週3回走っている")
-- MERGE: Add new details to an existing card without replacing (e.g. "コーヒーが好き" → "浅煎りブラックコーヒーが好き")
+- UPDATE: Replace the content of an existing card (when values change, e.g. "runs 2 times a week" -> "runs 3 times a week")
+- MERGE: Add new details to an existing card without replacing (e.g. "likes coffee" -> "likes light roast black coffee")
 - IGNORE: Skip this information (greetings, chit-chat, trivial statements)
 
 Rules:
@@ -20,13 +20,17 @@ Rules:
 7. Include "confidence" from 0.0 to 1.0
 8. Optionally include "subject", "property", "valueNumber", "unit" for factual data`;
 
+const MAX_EXISTING_CARDS_IN_PROMPT = 20;
+
 export function buildConsolidationPrompt(params: {
   newMessages: string;
   existingCards: Array<{ id: string; text: string }>;
 }): string {
+  const cards = params.existingCards.slice(0, MAX_EXISTING_CARDS_IN_PROMPT);
+  const skipped = params.existingCards.length - cards.length;
   const existingText =
-    params.existingCards.length > 0
-      ? `\n\nExisting memories:\n${params.existingCards.map((c) => `[${c.id}] ${c.text}`).join("\n")}`
+    cards.length > 0
+      ? `\n\nExisting memories:\n${cards.map((c) => `[${c.id}] ${c.text}`).join("\n")}${skipped > 0 ? `\n... and ${skipped} more` : ""}`
       : "";
 
   return `Analyze this conversation and decide what to remember.${existingText}

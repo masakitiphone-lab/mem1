@@ -17,7 +17,13 @@ export class ConfigManager {
       userConfig.llm?.config?.model || DEFAULT_MEMORY_CONFIG.llm.config.model;
     const llmApiKey =
       userConfig.llm?.config?.apiKey ||
-      DEFAULT_MEMORY_CONFIG.llm.config.apiKey;
+      process.env.GEMINI_API_KEY ||
+      "";
+
+    const dimension =
+      userConfig.vectorStore?.config?.dimension ??
+      userConfig.embedder?.config?.embeddingDims ??
+      DEFAULT_MEMORY_CONFIG.vectorStore.config.dimension;
 
     const mergedConfig: MemoryConfig = {
       version:
@@ -36,6 +42,7 @@ export class ConfigManager {
         config: {
           ...DEFAULT_MEMORY_CONFIG.vectorStore.config,
           ...userConfig.vectorStore?.config,
+          dimension,
         },
       },
       llm: {
@@ -56,14 +63,6 @@ export class ConfigManager {
         userConfig.sessionInterval ?? DEFAULT_MEMORY_CONFIG.sessionInterval,
     };
 
-    // Probe dimension if not set
-    if (!mergedConfig.vectorStore.config.dimension) {
-      const probeDims = userConfig.embedder?.config?.embeddingDims;
-      if (probeDims) {
-        mergedConfig.vectorStore.config.dimension = probeDims;
-      }
-    }
-
-    return MemoryConfigSchema.parse(mergedConfig as any);
+    return MemoryConfigSchema.parse(mergedConfig);
   }
 }

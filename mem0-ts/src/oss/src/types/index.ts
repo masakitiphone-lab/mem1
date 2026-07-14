@@ -11,7 +11,6 @@ export interface VectorStoreConfig {
   collectionName?: string;
   dimension?: number;
   dbPath?: string;
-  [key: string]: any;
 }
 
 export interface HistoryStoreConfig {
@@ -28,11 +27,15 @@ export interface LLMConfig {
   temperature?: number;
   topP?: number;
   maxTokens?: number;
-  [key: string]: any;
+  timeoutMs?: number;
+  retryCount?: number;
 }
 
 export interface RerankerConfig {
-  [key: string]: any;
+  baseLevelDecay?: number;
+  fadeWeight?: number;
+  vectorWeight?: number;
+  minStrength?: number;
 }
 
 export interface MemoryCard {
@@ -74,7 +77,6 @@ export interface SearchFilters {
   user_id?: string;
   agent_id?: string;
   run_id?: string;
-  [key: string]: any;
 }
 
 export interface SearchResult {
@@ -104,20 +106,38 @@ export const MemoryConfigSchema = z.object({
   version: z.string().optional(),
   embedder: z.object({
     provider: z.string(),
-    config: z.record(z.string(), z.any()),
+    config: z.object({
+      apiKey: z.string().optional(),
+      model: z.string().optional(),
+      baseURL: z.string().optional(),
+      embeddingDims: z.number().optional(),
+    }),
   }),
   vectorStore: z.object({
     provider: z.string(),
-    config: z.record(z.string(), z.any()),
+    config: z.object({
+      collectionName: z.string().optional(),
+      dimension: z.number().optional(),
+      dbPath: z.string().optional(),
+    }),
   }),
   llm: z.object({
     provider: z.string(),
-    config: z.record(z.string(), z.any()),
+    config: z.object({
+      apiKey: z.string().optional(),
+      model: z.string().optional(),
+      baseURL: z.string().optional(),
+      temperature: z.number().optional(),
+      topP: z.number().optional(),
+      maxTokens: z.number().optional(),
+    }),
   }),
   historyStore: z
     .object({
       provider: z.string(),
-      config: z.record(z.string(), z.any()),
+      config: z.object({
+        historyDbPath: z.string().optional(),
+      }),
     })
     .optional(),
   disableHistory: z.boolean().optional(),

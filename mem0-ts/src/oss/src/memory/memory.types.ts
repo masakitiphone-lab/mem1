@@ -42,4 +42,5 @@ export interface ConsolidateResult {
   }>;
   archivedCount: number;
   sessionCounter: number;
+  error?: string;
 }

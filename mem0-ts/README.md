@@ -1,64 +1,157 @@
-# Mem0 - The Memory Layer for Your AI Apps
+# Mem1 - Memory Card System with ACT-R + Fade Architecture
 
-Mem0 is a self-improving memory layer for LLM applications, enabling personalized AI experiences that save costs and delight users. We offer both cloud and open-source solutions to cater to different needs.
+A local-first memory system for AI apps, using **ACT-R activation** + **Fade decay** for session-based forgetting. No LLM used for search (<500ms target). LLM (Gemini) used only for consolidation.
 
-See the complete [OSS Docs](https://docs.mem0.ai/open-source/node-quickstart).
-See the complete [Platform API Reference](https://docs.mem0.ai/api-reference).
+Forked from [mem0ai/mem0](https://github.com/mem0ai/mem0), completely rewritten in TypeScript.
 
-## 1. Installation
+## Architecture
 
-For the open-source version, you can install the Mem0 package using npm:
-
-```bash
-npm i mem0ai
+```
+User Query → Embedding (FastEmbed) → Vector Search → ACT-R+Fade Rerank → Results
+                                          ↕
+Session Counter → Fade Decay (strength = baseStrength × 2^(-elapsed/halfLife))
+                                          ↕
+        LLM Consolidation (every N sessions) → ADD/UPDATE/MERGE cards
 ```
 
-## 2. API Key Setup
+- **MemoryCard**: text + vector + ACT-R metadata (accessCount, baseStrength, halfLifeSessions, etc.)
+- **Search**: vector cosine similarity → ACT-R activation boost → Fade strength filter
+- **Fade**: `strength = baseStrength × 2^(-elapsedSessions / halfLifeSessions)`
+- **ACT-R**: `finalScore = vectorSim² × (1 + 0.15 × actrActivation) × (0.95 + 0.05 × fadeStrength)`
+- **Status lifecycle**: `active` → `archived` (strength < 0.05) → `deleted`
+- **Consolidation**: LLM decides ADD / UPDATE / MERGE / IGNORE based on conversation
 
-For the cloud offering, sign in to [Mem0 Platform](https://app.mem0.ai/dashboard/api-keys?utm_source=oss&utm_medium=mem0-ts-readme) to obtain your API Key.
+## Installation
 
-## 3. Client Features
+```bash
+npm install mem1
+# Optional: for local embeddings
+npm install fastembed
+```
 
-### Cloud Offering
+Requires Node >= 18.
 
-The cloud version provides a comprehensive set of features, including:
+## Quick Start
 
-- **Memory Operations**: Perform CRUD operations on memories.
-- **Search Capabilities**: Search for relevant memories using advanced filters.
-- **Memory History**: Track changes to memories over time.
-- **Error Handling**: Robust error handling for API-related issues.
-- **Async/Await Support**: All methods return promises for easy integration.
+```typescript
+import { Memory } from "mem1";
 
-### Open-Source Offering
+const memory = new Memory({
+  llm: {
+    config: { apiKey: process.env.GEMINI_API_KEY },
+  },
+});
 
-The open-source version includes the following top features:
+// Add a session (auto-triggers consolidation every 20 sessions)
+await memory.addSession("chat-1", [
+  { role: "user", content: "I like dark roast coffee" },
+  { role: "assistant", content: "Noted! I'll remember that." },
+]);
 
-- **Memory Management**: Add, update, delete, and retrieve memories.
-- **Vector Store Integration**: Supports various vector store providers for efficient memory retrieval.
-- **LLM Support**: Integrates with multiple LLM providers for generating responses.
-- **Customizable Configuration**: Easily configure memory settings and providers.
-- **SQLite Storage**: Use SQLite for memory history management.
+// Search (no LLM used)
+const { results, metrics } = await memory.search("coffee preferences");
+console.log(results, metrics);
 
-## 4. Memory Operations
+// Force consolidation
+const result = await memory.consolidate({
+  messages: [
+    { role: "user", content: "I prefer light roast actually" },
+    { role: "assistant", content: "Updated!" },
+  ],
+});
 
-Mem0 provides a simple and customizable interface for performing memory operations. You can create long-term and short-term memories, search for relevant memories, and manage memory history.
+// Manually reinforce cards
+await memory.reinforce(["card-id-1", "card-id-2"]);
 
-## 5. Error Handling
+// Archive faded cards
+await memory.archiveFaded();
 
-The MemoryClient throws errors for any API-related issues. You can catch and handle these errors effectively.
+// CRUD
+const card = await memory.get("card-id-1");
+const { results, total } = await memory.getAll({ user_id: "user-1" });
+await memory.delete("card-id-1");
+await memory.reset();
+```
 
-## 6. Using with async/await
+## API
 
-All methods of the MemoryClient return promises, allowing for seamless integration with async/await syntax.
+### `new Memory(config?, reranker?)`
 
-## 7. Testing the Client
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `config` | `Partial<MemoryConfig>` | Default config | See Config below |
+| `reranker` | `Reranker` | `ActrReranker` | Optional custom reranker |
 
-To test the MemoryClient in a Node.js environment, you can create a simple script to verify the functionality of memory operations.
+### Methods
 
-## Getting Help
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `search(query, options)` | `{ results, metrics }` | Semantic search (no LLM, <500ms target) |
+| `consolidate(options)` | `ConsolidateResult` | LLM-based memory consolidation |
+| `addSession(scope, messages?)` | `{ sessionCounter, consolidated }` | Increment session, auto-consolidate at interval |
+| `reinforce(cardIds, session?)` | `void` | Boost card strength |
+| `archiveFaded(options?)` | `{ archivedCount }` | Archive/delete decayed cards |
+| `get(id)` | `MemoryCard \| null` | Get card by ID |
+| `getAll(filters?, topK?)` | `{ results, total }` | List active cards |
+| `delete(id)` | `void` | Delete card permanently |
+| `reset()` | `void` | Delete all data |
+| `rebuildIndex()` | `void` | Rebuild in-memory vector index |
+| `getLastMetrics()` | `SearchMetrics \| null` | Last search latency breakdown |
+| `getCurrentSession()` | `number` | Current session counter |
 
-If you have any questions or need assistance, please reach out to us:
+### Config
 
-- Email: founders@mem0.ai
-- [Join our discord community](https://mem0.ai/discord)
-- GitHub Issues: [Report bugs or request features](https://github.com/mem0ai/mem0/issues)
+```typescript
+interface MemoryConfig {
+  version?: string;
+  embedder: {
+    provider: "fastembed";
+    config: { model?: string; embeddingDims?: number };
+  };
+  vectorStore: {
+    provider: "memory";
+    config: { dimension?: number; dbPath?: string };
+  };
+  llm: {
+    provider: "google" | "gemini";
+    config: { apiKey?: string; model?: string };
+  };
+  historyStore?: {
+    provider: "sqlite";
+    config: { historyDbPath?: string };
+  };
+  disableHistory?: boolean;
+  sessionInterval?: number; // default: 20
+}
+```
+
+Environment variables: `GEMINI_API_KEY`, `MEMORY_DB_PATH`, `HISTORY_DB_PATH`, `SESSION_INTERVAL`.
+
+### ConsolidateResult
+
+```typescript
+interface ConsolidateResult {
+  operations: Array<{
+    action: "ADD" | "UPDATE" | "MERGE";
+    cardId?: string;
+    text: string;
+    confidence: number;
+  }>;
+  archivedCount: number;
+  sessionCounter: number;
+  error?: string; // present if LLM call failed
+}
+```
+
+## Express API Server
+
+```bash
+GEMINI_API_KEY=your_key npm start
+# Server at http://localhost:3000
+```
+
+Endpoints: `GET /api/v1/health`, `POST /api/v1/search`, `POST /api/v1/consolidate`, `POST /api/v1/session`, `POST /api/v1/reinforce`, `POST /api/v1/archive-faded`, `GET /api/v1/cards`, `GET /api/v1/cards/:id`, `DELETE /api/v1/cards/:id`, `POST /api/v1/reset`, `POST /api/v1/rebuild-index`.
+
+## License
+
+Apache-2.0
