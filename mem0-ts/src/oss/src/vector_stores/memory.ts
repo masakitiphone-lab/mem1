@@ -1,5 +1,4 @@
 import Database from "better-sqlite3";
-import path from "path";
 import { VectorStore, ReinforceEntry } from "./base";
 import { MemoryCard, SearchFilters, VectorStoreConfig } from "../types";
 import {

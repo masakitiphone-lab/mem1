@@ -56,7 +56,13 @@ export class SQLiteManager implements HistoryManager {
       .prepare(
         `SELECT * FROM memory_history WHERE card_id = ? ORDER BY id ASC`,
       )
-      .all(cardId) as any[];
+      .all(cardId) as Array<{
+      card_id: string;
+      action: "ADD" | "UPDATE" | "MERGE" | "DELETE" | "ARCHIVE";
+      previous_text: string | null;
+      new_text: string | null;
+      created_at: string;
+    }>;
     return rows.map((r) => ({
       cardId: r.card_id,
       action: r.action,

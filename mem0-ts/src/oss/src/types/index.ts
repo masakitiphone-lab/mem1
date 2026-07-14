@@ -31,13 +31,6 @@ export interface LLMConfig {
   retryCount?: number;
 }
 
-export interface RerankerConfig {
-  baseLevelDecay?: number;
-  fadeWeight?: number;
-  vectorWeight?: number;
-  minStrength?: number;
-}
-
 export interface MemoryCard {
   id: string;
   text: string;

@@ -22,6 +22,6 @@ export interface LLM {
     messages: Array<{ role: string; content: string }>,
     response_format?: { type: string },
     tools?: ToolDef[],
-  ): Promise<any>;
+  ): Promise<string | LLMResponse>;
   generateChat(messages: Message[]): Promise<LLMResponse>;
 }

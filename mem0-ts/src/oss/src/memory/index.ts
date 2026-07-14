@@ -3,7 +3,6 @@ import { createHash } from "crypto";
 import {
   MemoryConfig,
   MemoryCard,
-  Message,
   SearchFilters,
 } from "../types";
 import {
@@ -23,7 +22,6 @@ import { CONSOLIDATE_SYSTEM_PROMPT, buildConsolidationPrompt } from "../prompts"
 import {
   SearchOptions,
   ConsolidateOptions,
-  ReinforceOptions,
   ArchiveOptions,
   SearchMetrics,
   ConsolidateResult,
@@ -94,7 +92,6 @@ export class Memory {
     this.reranker = reranker ?? new ActrReranker({}, 0);
 
     this._initPromise = this._initialize().catch((error) => {
-      console.error("Memory initialization failed:", error);
       throw error;
     });
   }
@@ -223,12 +220,12 @@ export class Memory {
         ],
         { type: "json_object" },
       )) as string;
-    } catch (e: any) {
+    } catch (e: unknown) {
       return {
         operations: [],
         archivedCount: 0,
         sessionCounter: this.sessionCounter,
-        error: `LLM consolidation failed: ${e.message}`,
+        error: `LLM consolidation failed: ${(e as Error).message}`,
       };
     }
 

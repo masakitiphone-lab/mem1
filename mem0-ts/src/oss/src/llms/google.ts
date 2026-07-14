@@ -20,9 +20,9 @@ export class GoogleLLM implements LLM {
     this.retryCount = config.retryCount ?? 2;
   }
 
-  private async fetchWithRetry(
-    request: () => Promise<any>,
-  ): Promise<any> {
+  private async fetchWithRetry<T>(
+    request: () => Promise<T>,
+  ): Promise<T> {
     let lastError: Error | null = null;
     for (let attempt = 0; attempt <= this.retryCount; attempt++) {
       try {
@@ -34,8 +34,8 @@ export class GoogleLLM implements LLM {
         } finally {
           clearTimeout(timer);
         }
-      } catch (e: any) {
-        lastError = e;
+      } catch (e: unknown) {
+        lastError = e as Error;
         if (attempt < this.retryCount) {
           const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
           await new Promise((r) => setTimeout(r, delay));

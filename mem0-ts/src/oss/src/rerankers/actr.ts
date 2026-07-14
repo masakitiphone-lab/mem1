@@ -1,6 +1,6 @@
 import { Reranker } from "./base";
 
-export interface ActrConfig {
+interface ActrConfig {
   baseLevelDecay: number;
   weight: number;
   fadeWeight: number;
@@ -8,18 +8,13 @@ export interface ActrConfig {
   minStrength: number;
 }
 
-export const DEFAULT_ACTR_CONFIG: ActrConfig = {
+const DEFAULT_ACTR_CONFIG: ActrConfig = {
   baseLevelDecay: 0.5,
   weight: 0.15,
   fadeWeight: 0.05,
   vectorWeight: 1.0,
   minStrength: 0.05,
 };
-
-export interface RerankMetrics {
-  totalMs: number;
-  candidatesCount: number;
-}
 
 /**
  * ACT-R + Fade リランカー
@@ -146,8 +141,4 @@ export class ActrReranker implements Reranker {
   }
 }
 
-export function createActrReranker(
-  currentSession: number,
-): ActrReranker {
-  return new ActrReranker({}, currentSession);
-}
+

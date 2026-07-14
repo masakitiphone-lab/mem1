@@ -13,9 +13,9 @@ export function ensureSQLiteDirectory(dbPath: string): void {
 
   try {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  } catch (error: any) {
+  } catch (error: unknown) {
     throw new Error(
-      `Failed to create directory for SQLite database at "${dbPath}": ${error.message}`,
+      `Failed to create directory for SQLite database at "${dbPath}": ${(error as Error).message}`,
     );
   }
 }
