@@ -1,4 +1,3 @@
-import type { FlagEmbedding } from "fastembed";
 import { Embedder } from "./base";
 import { EmbeddingConfig } from "../types";
 
@@ -22,7 +21,7 @@ const DEFAULT_MODEL: FastEmbedModel = "fast-bge-small-en-v1.5";
 
 export class FastEmbedEmbedder implements Embedder {
   private readonly modelName: FastEmbedModel;
-  private embeddingModel?: Promise<FlagEmbedding>;
+  private embeddingModel?: Promise<any>;
 
   constructor(config: EmbeddingConfig) {
     if (typeof config.model === "string" && config.model.length > 0) {
@@ -38,7 +37,7 @@ export class FastEmbedEmbedder implements Embedder {
     }
   }
 
-  private getEmbeddingModel(): Promise<FlagEmbedding> {
+  private getEmbeddingModel(): Promise<any> {
     if (!this.embeddingModel) {
       this.embeddingModel = this.initEmbeddingModel().catch((error) => {
         this.embeddingModel = undefined;
@@ -49,13 +48,10 @@ export class FastEmbedEmbedder implements Embedder {
     return this.embeddingModel;
   }
 
-  /**
-   * Lazily import the optional `fastembed` peer and initialize the model, so
-   * consumers that never touch FastEmbed don't need it installed.
-   */
-  private async initEmbeddingModel(): Promise<FlagEmbedding> {
+  private async initEmbeddingModel(): Promise<any> {
     let sdk: any;
     try {
+      // @ts-ignore - fastembed is optional peer dep
       sdk = await import("fastembed");
     } catch {
       throw new Error(

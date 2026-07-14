@@ -1,29 +1,25 @@
 import { MemoryConfig } from "../types";
 
 export const DEFAULT_MEMORY_CONFIG: MemoryConfig = {
-  disableHistory: false,
-  version: "v1.1",
+  version: "v2.0",
   embedder: {
-    provider: "openai",
+    provider: "fastembed",
     config: {
-      apiKey: process.env.OPENAI_API_KEY || "",
-      model: "text-embedding-3-small",
+      model: "fast-bge-small-en-v1.5",
     },
   },
   vectorStore: {
     provider: "memory",
     config: {
       collectionName: "memories",
-      dimension: 1536,
+      dimension: 384,
     },
   },
   llm: {
-    provider: "openai",
+    provider: "google",
     config: {
-      baseURL: "https://api.openai.com/v1",
-      apiKey: process.env.OPENAI_API_KEY || "",
-      model: "gpt-5-mini",
-      modelProperties: undefined,
+      model: "gemini-2.0-flash",
+      apiKey: process.env.GEMINI_API_KEY || "",
     },
   },
   historyStore: {
@@ -32,4 +28,5 @@ export const DEFAULT_MEMORY_CONFIG: MemoryConfig = {
       historyDbPath: "memory.db",
     },
   },
+  sessionInterval: 20,
 };

@@ -1,60 +1,45 @@
-import { Message } from "../types";
 import { SearchFilters } from "../types";
 
-export interface Entity {
-  userId?: string;
-  agentId?: string;
-  runId?: string;
-}
-
-export interface AddMemoryOptions extends Entity {
-  metadata?: Record<string, any>;
-  filters?: SearchFilters;
-  infer?: boolean;
-  timestamp?: number | string | Date | null;
-  /** Date (YYYY-MM-DD) after which the memory is considered expired. */
-  expirationDate?: string | null;
-}
-
-export interface UpdateMemoryOptions {
-  /** New content to update the memory with. */
-  text?: string;
-  /**
-   * New content to update the memory with.
-   * @deprecated Use `text` instead. Will be removed in the next major release.
-   */
-  data?: string;
-  /** Metadata merged into the memory's existing metadata. */
-  metadata?: Record<string, any>;
-  /** Date (YYYY-MM-DD) after which the memory expires, or `null` to clear it. */
-  expirationDate?: string | null;
-}
-
-export interface SearchMemoryOptions {
+export interface SearchOptions {
+  query: string;
   topK?: number;
   filters?: SearchFilters;
   threshold?: number;
-  explain?: boolean;
-  referenceDate?: number | string | Date | null;
-  /**
-   * Re-rank the results with the configured reranker before returning. No-op
-   * when no `reranker` is configured on the Memory.
-   */
-  rerank?: boolean;
-  /** Include expired memories in the results. Defaults to false. */
-  showExpired?: boolean;
+  candidateCount?: number;
 }
 
-export interface GetAllMemoryOptions {
-  topK?: number;
-  filters?: SearchFilters;
-  /** Include expired memories in the results. Defaults to false. */
-  showExpired?: boolean;
+export interface ConsolidateOptions {
+  messages: Array<{ role: string; content: string }>;
+  userId?: string;
+  agentId?: string;
+  runId?: string;
+  metadata?: Record<string, any>;
 }
 
-export interface DeleteAllMemoryOptions extends Entity {}
+export interface ReinforceOptions {
+  cardIds: string[];
+  currentSession: number;
+}
 
-export interface UpdateProjectOptions {
-  decay?: boolean;
-  [key: string]: any;
+export interface ArchiveOptions {
+  strengthThreshold?: number;
+}
+
+export interface SearchMetrics {
+  embeddingMs: number;
+  vectorSearchMs: number;
+  rerankMs: number;
+  reinforceMs: number;
+  totalMs: number;
+}
+
+export interface ConsolidateResult {
+  operations: Array<{
+    action: string;
+    cardId?: string;
+    text: string;
+    confidence: number;
+  }>;
+  archivedCount: number;
+  sessionCounter: number;
 }

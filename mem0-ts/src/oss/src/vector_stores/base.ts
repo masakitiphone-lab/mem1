@@ -1,34 +1,21 @@
-import { SearchFilters, VectorStoreResult } from "../types";
+import { SearchFilters } from "../types";
+import { MemoryCard } from "../types";
 
 export interface VectorStore {
-  insert(
-    vectors: number[][],
-    ids: string[],
-    payloads: Record<string, any>[],
-  ): Promise<void>;
+  insert(cards: MemoryCard[]): Promise<void>;
   search(
-    query: number[],
-    topK?: number,
+    queryVector: number[],
+    topK: number,
     filters?: SearchFilters,
-  ): Promise<VectorStoreResult[]>;
-  keywordSearch?(
-    query: string,
-    topK?: number,
-    filters?: SearchFilters,
-  ): Promise<VectorStoreResult[] | null>;
-  get(vectorId: string): Promise<VectorStoreResult | null>;
-  update(
-    vectorId: string,
-    vector: number[],
-    payload: Record<string, any>,
-  ): Promise<void>;
-  delete(vectorId: string): Promise<void>;
-  deleteCol(): Promise<void>;
+  ): Promise<Array<{ id: string; score: number; card: MemoryCard }>>;
+  get(id: string): Promise<MemoryCard | null>;
+  update(id: string, card: Partial<MemoryCard>): Promise<void>;
+  delete(id: string): Promise<void>;
   list(
     filters?: SearchFilters,
     topK?: number,
-  ): Promise<[VectorStoreResult[], number]>;
-  getUserId(): Promise<string>;
-  setUserId(userId: string): Promise<void>;
+  ): Promise<[MemoryCard[], number]>;
+  deleteAll(filters?: SearchFilters): Promise<void>;
+  rebuildIndex(): Promise<void>;
   initialize(): Promise<void>;
 }

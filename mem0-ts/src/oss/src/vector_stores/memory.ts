@@ -1,17 +1,16 @@
-import { VectorStore } from "./base";
-import { SearchFilters, VectorStoreConfig, VectorStoreResult } from "../types";
 import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
+import { VectorStore } from "./base";
+import { MemoryCard, SearchFilters, VectorStoreConfig } from "../types";
 import {
   ensureSQLiteDirectory,
   getDefaultVectorStoreDbPath,
 } from "../utils/sqlite";
 
-interface MemoryVector {
+interface IndexEntry {
   id: string;
-  vector: number[];
-  payload: Record<string, any>;
+  vector: Float32Array;
 }
 
 export class MemoryVectorStore implements VectorStore {
@@ -19,473 +18,321 @@ export class MemoryVectorStore implements VectorStore {
   private dimension: number;
   private dbPath: string;
 
-  private static readonly CAMEL_TO_SNAKE: Record<string, string> = {
-    userId: "user_id",
-    agentId: "agent_id",
-    runId: "run_id",
-  };
-
-  private normalizePayload(payload: Record<string, any>): Record<string, any> {
-    for (const [camel, snake] of Object.entries(
-      MemoryVectorStore.CAMEL_TO_SNAKE,
-    )) {
-      if (camel in payload && !(snake in payload)) {
-        payload[snake] = payload[camel];
-        delete payload[camel];
-      }
-    }
-    return payload;
-  }
+  private index: IndexEntry[] = [];
+  private indexLoaded = false;
 
   constructor(config: VectorStoreConfig) {
-    this.dimension = config.dimension || 1536; // Default OpenAI dimension
+    this.dimension = config.dimension || 384;
     this.dbPath = config.dbPath || getDefaultVectorStoreDbPath();
-
-    if (!config.dbPath) {
-      const oldDefault = path.join(process.cwd(), "vector_store.db");
-      if (fs.existsSync(oldDefault) && oldDefault !== this.dbPath) {
-        console.warn(
-          `[mem0] Default vector_store.db location changed from ${oldDefault} to ${this.dbPath}. ` +
-            `Move your existing file or set vectorStore.config.dbPath explicitly.`,
-        );
-      }
-    }
-
     ensureSQLiteDirectory(this.dbPath);
     this.db = new Database(this.dbPath);
+    this.db.pragma("journal_mode = WAL");
     this.init();
   }
 
   private init(): void {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS cards (
+        id TEXT PRIMARY KEY,
+        text TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        session_created INTEGER NOT NULL DEFAULT 0,
+        last_reinforced_session INTEGER NOT NULL DEFAULT 0,
+        base_strength REAL NOT NULL DEFAULT 1.0,
+        half_life_sessions INTEGER NOT NULL DEFAULT 20,
+        access_count INTEGER NOT NULL DEFAULT 0,
+        last_accessed_session INTEGER NOT NULL DEFAULT 0,
+        recent_access_sessions TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'active',
+        memory_type TEXT,
+        subject TEXT,
+        property TEXT,
+        value_number REAL,
+        unit TEXT,
+        user_id TEXT,
+        agent_id TEXT,
+        run_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_cards_user ON cards(user_id)
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status)
+    `);
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS vectors (
         id TEXT PRIMARY KEY,
         vector BLOB NOT NULL,
-        payload TEXT NOT NULL
-      )
-    `);
-
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS memory_migrations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL UNIQUE
+        FOREIGN KEY (id) REFERENCES cards(id)
       )
     `);
   }
 
-  private cosineSimilarity(a: number[], b: number[]): number {
-    let dotProduct = 0;
-    let normA = 0;
-    let normB = 0;
-    for (let i = 0; i < a.length; i++) {
-      dotProduct += a[i] * b[i];
-      normA += a[i] * a[i];
-      normB += b[i] * b[i];
-    }
-    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-  }
-
-  /**
-   * Check if a single field condition matches the payload.
-   * Supports comparison operators: eq, ne, gt, gte, lt, lte, in, nin, contains, icontains
-   */
-  private matchFieldCondition(
-    payload: Record<string, any>,
-    key: string,
-    value: any,
-  ): boolean {
-    const payloadValue = payload[key];
-
-    // Handle non-dict values
-    if (typeof value !== "object" || value === null) {
-      // Wildcard: match any value
-      if (value === "*") {
-        return true;
-      }
-      // Simple equality
-      return payloadValue === value;
-    }
-
-    // Handle array shorthand: {"field": ["a", "b"]} treated as "in" operator
-    if (Array.isArray(value)) {
-      return value.includes(payloadValue);
-    }
-
-    // Handle comparison operators
-    if ("eq" in value) {
-      return payloadValue === value.eq;
-    }
-    if ("ne" in value) {
-      return payloadValue !== value.ne;
-    }
-    if ("gt" in value) {
-      return payloadValue > value.gt;
-    }
-    if ("gte" in value) {
-      return payloadValue >= value.gte;
-    }
-    if ("lt" in value) {
-      return payloadValue < value.lt;
-    }
-    if ("lte" in value) {
-      return payloadValue <= value.lte;
-    }
-    if ("in" in value) {
-      return Array.isArray(value.in) && value.in.includes(payloadValue);
-    }
-    if ("nin" in value) {
-      return !Array.isArray(value.nin) || !value.nin.includes(payloadValue);
-    }
-    if ("contains" in value) {
-      return (
-        typeof payloadValue === "string" &&
-        payloadValue.includes(value.contains)
-      );
-    }
-    if ("icontains" in value) {
-      return (
-        typeof payloadValue === "string" &&
-        payloadValue.toLowerCase().includes(value.icontains.toLowerCase())
-      );
-    }
-
-    // Unknown operator - treat as nested object for equality (shouldn't happen normally)
-    return payloadValue === value;
-  }
-
-  /**
-   * Filter a vector by the given filters.
-   * Supports logical operators (AND, OR, NOT) and comparison operators.
-   */
-  private filterVector(vector: MemoryVector, filters?: SearchFilters): boolean {
-    if (!filters || Object.keys(filters).length === 0) return true;
-
-    // Normalize $or/$not/$and → OR/NOT/AND
-    const keyMap: Record<string, string> = {
-      $and: "AND",
-      $or: "OR",
-      $not: "NOT",
-    };
-    const normalized: Record<string, any> = {};
-    for (const [key, value] of Object.entries(filters)) {
-      const normKey = keyMap[key] || key;
-      if (!(normKey in normalized)) {
-        normalized[normKey] = value;
-      }
-    }
-
-    for (const [key, value] of Object.entries(normalized)) {
-      // Handle logical operators
-      if (key === "AND") {
-        if (!Array.isArray(value)) {
-          throw new Error(
-            `AND filter value must be a list of filter dicts, got ${typeof value}`,
-          );
-        }
-        // All conditions must match
-        const allMatch = value.every((sub: SearchFilters) =>
-          this.filterVector(vector, sub),
-        );
-        if (!allMatch) return false;
-      } else if (key === "OR") {
-        if (!Array.isArray(value)) {
-          throw new Error(
-            `OR filter value must be a list of filter dicts, got ${typeof value}`,
-          );
-        }
-        // At least one condition must match
-        const anyMatch = value.some((sub: SearchFilters) =>
-          this.filterVector(vector, sub),
-        );
-        if (!anyMatch) return false;
-      } else if (key === "NOT") {
-        if (!Array.isArray(value)) {
-          throw new Error(
-            `NOT filter value must be a list of filter dicts, got ${typeof value}`,
-          );
-        }
-        // None of the conditions should match
-        const noneMatch = value.every(
-          (sub: SearchFilters) => !this.filterVector(vector, sub),
-        );
-        if (!noneMatch) return false;
-      } else {
-        // Regular field condition
-        if (!this.matchFieldCondition(vector.payload, key, value)) {
-          return false;
-        }
-      }
-    }
-
-    return true;
-  }
-
-  async insert(
-    vectors: number[][],
-    ids: string[],
-    payloads: Record<string, any>[],
-  ): Promise<void> {
-    const stmt = this.db.prepare(
-      `INSERT OR REPLACE INTO vectors (id, vector, payload) VALUES (?, ?, ?)`,
-    );
-    const insertMany = this.db.transaction(
-      (vecs: number[][], vIds: string[], vPayloads: Record<string, any>[]) => {
-        for (let i = 0; i < vecs.length; i++) {
-          if (vecs[i].length !== this.dimension) {
-            throw new Error(
-              `Vector dimension mismatch. Expected ${this.dimension}, got ${vecs[i].length}`,
-            );
-          }
-          const vectorBuffer = Buffer.from(new Float32Array(vecs[i]).buffer);
-          stmt.run(vIds[i], vectorBuffer, JSON.stringify(vPayloads[i]));
-        }
-      },
-    );
-    insertMany(vectors, ids, payloads);
-  }
-
-  private tokenize(text: string): string[] {
-    return text.toLowerCase().split(/\s+/).filter(Boolean);
-  }
-
-  async keywordSearch(
-    query: string,
-    topK: number = 10,
-    filters?: SearchFilters,
-  ): Promise<VectorStoreResult[] | null> {
-    try {
-      const rows = this.db.prepare(`SELECT * FROM vectors`).all() as any[];
-
-      // Collect documents that pass the filter
-      const candidates: {
-        id: string;
-        payload: Record<string, any>;
-        tokens: string[];
-      }[] = [];
-
-      for (const row of rows) {
-        const payload = this.normalizePayload(JSON.parse(row.payload));
-        const memoryVector: MemoryVector = {
-          id: row.id,
-          vector: Array.from(
-            new Float32Array(
-              row.vector.buffer,
-              row.vector.byteOffset,
-              row.vector.byteLength / 4,
-            ),
-          ),
-          payload,
-        };
-
-        if (this.filterVector(memoryVector, filters)) {
-          const text = payload.textLemmatized || payload.data || "";
-          candidates.push({ id: row.id, payload, tokens: this.tokenize(text) });
-        }
-      }
-
-      if (candidates.length === 0) {
-        return [];
-      }
-
-      const tokenizedQuery = this.tokenize(query);
-      if (tokenizedQuery.length === 0) {
-        return [];
-      }
-
-      // Compute BM25 scores inline
-      const k1 = 1.5;
-      const b = 0.75;
-      const N = candidates.length;
-      const avgDocLength =
-        candidates.reduce((sum, c) => sum + c.tokens.length, 0) / N;
-
-      // Compute document frequency for query terms
-      const docFreq = new Map<string, number>();
-      for (const term of tokenizedQuery) {
-        if (!docFreq.has(term)) {
-          let count = 0;
-          for (const c of candidates) {
-            if (c.tokens.includes(term)) count++;
-          }
-          docFreq.set(term, count);
-        }
-      }
-
-      // Compute IDF for query terms
-      const idf = new Map<string, number>();
-      for (const [term, freq] of docFreq) {
-        idf.set(term, Math.log((N - freq + 0.5) / (freq + 0.5) + 1));
-      }
-
-      // Score each candidate
-      const scored = candidates.map((candidate) => {
-        let score = 0;
-        const docLength = candidate.tokens.length;
-        for (const term of tokenizedQuery) {
-          const tf = candidate.tokens.filter((t) => t === term).length;
-          const termIdf = idf.get(term) || 0;
-          score +=
-            (termIdf * tf * (k1 + 1)) /
-            (tf + k1 * (1 - b + (b * docLength) / avgDocLength));
-        }
-        return { ...candidate, score };
-      });
-
-      // Filter out zero-score documents and sort descending
-      const results = scored
-        .filter((s) => s.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, topK)
-        .map((s) => ({
-          id: s.id,
-          payload: s.payload,
-          score: s.score,
-        }));
-
-      return results;
-    } catch (error) {
-      console.error("Error during keyword search:", error);
-      return null;
-    }
-  }
-
-  async search(
-    query: number[],
-    topK: number = 10,
-    filters?: SearchFilters,
-  ): Promise<VectorStoreResult[]> {
-    if (query.length !== this.dimension) {
-      throw new Error(
-        `Query dimension mismatch. Expected ${this.dimension}, got ${query.length}`,
-      );
-    }
-
-    const rows = this.db.prepare(`SELECT * FROM vectors`).all() as any[];
-    const results: VectorStoreResult[] = [];
-
-    for (const row of rows) {
-      const vector = new Float32Array(
+  private loadIndex(): void {
+    if (this.indexLoaded) return;
+    const rows = this.db
+      .prepare("SELECT id, vector FROM vectors")
+      .all() as Array<{ id: string; vector: Buffer }>;
+    this.index = rows.map((row) => ({
+      id: row.id,
+      vector: new Float32Array(
         row.vector.buffer,
         row.vector.byteOffset,
         row.vector.byteLength / 4,
-      );
-      const payload = this.normalizePayload(JSON.parse(row.payload));
-      const memoryVector: MemoryVector = {
-        id: row.id,
-        vector: Array.from(vector),
-        payload,
-      };
-
-      if (this.filterVector(memoryVector, filters)) {
-        const score = this.cosineSimilarity(query, Array.from(vector));
-        results.push({
-          id: memoryVector.id,
-          payload: memoryVector.payload,
-          score,
-        });
-      }
-    }
-
-    results.sort((a, b) => (b.score || 0) - (a.score || 0));
-    return results.slice(0, topK);
+      ),
+    }));
+    this.indexLoaded = true;
   }
 
-  async get(vectorId: string): Promise<VectorStoreResult | null> {
-    const row = this.db
-      .prepare(`SELECT * FROM vectors WHERE id = ?`)
-      .get(vectorId) as any;
-    if (!row) return null;
+  private invalidateIndex(): void {
+    this.indexLoaded = false;
+    this.index = [];
+  }
 
-    const payload = this.normalizePayload(JSON.parse(row.payload));
+  private cosineSimilarity(a: Float32Array, b: number[]): number {
+    let dot = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    const denom = Math.sqrt(normA) * Math.sqrt(normB);
+    return denom === 0 ? 0 : dot / denom;
+  }
+
+  private cardFromRow(row: any): MemoryCard {
     return {
       id: row.id,
-      payload,
+      text: row.text,
+      hash: row.hash,
+      sessionCreated: row.session_created,
+      lastReinforcedSession: row.last_reinforced_session,
+      baseStrength: row.base_strength,
+      halfLifeSessions: row.half_life_sessions,
+      accessCount: row.access_count,
+      lastAccessedSession: row.last_accessed_session,
+      recentAccessSessions: JSON.parse(row.recent_access_sessions || "[]"),
+      status: row.status,
+      memoryType: row.memory_type,
+      subject: row.subject,
+      property: row.property,
+      valueNumber: row.value_number,
+      unit: row.unit,
+      userId: row.user_id,
+      agentId: row.agent_id,
+      runId: row.run_id,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
     };
   }
 
-  async update(
-    vectorId: string,
-    vector: number[],
-    payload: Record<string, any>,
-  ): Promise<void> {
-    if (vector.length !== this.dimension) {
-      throw new Error(
-        `Vector dimension mismatch. Expected ${this.dimension}, got ${vector.length}`,
-      );
+  private buildWhereClause(
+    filters?: SearchFilters,
+  ): { where: string; params: any[] } {
+    const clauses: string[] = ["status = 'active'"];
+    const params: any[] = [];
+    if (filters?.user_id) {
+      clauses.push("user_id = ?");
+      params.push(filters.user_id);
     }
-    const vectorBuffer = Buffer.from(new Float32Array(vector).buffer);
-    this.db
-      .prepare(`UPDATE vectors SET vector = ?, payload = ? WHERE id = ?`)
-      .run(vectorBuffer, JSON.stringify(payload), vectorId);
+    if (filters?.agent_id) {
+      clauses.push("agent_id = ?");
+      params.push(filters.agent_id);
+    }
+    if (filters?.run_id) {
+      clauses.push("run_id = ?");
+      params.push(filters.run_id);
+    }
+    return { where: clauses.join(" AND "), params };
   }
 
-  async delete(vectorId: string): Promise<void> {
-    this.db.prepare(`DELETE FROM vectors WHERE id = ?`).run(vectorId);
+  async insert(cards: MemoryCard[]): Promise<void> {
+    const insertCard = this.db.prepare(`
+      INSERT OR REPLACE INTO cards
+        (id, text, hash, session_created, last_reinforced_session,
+         base_strength, half_life_sessions, access_count,
+         last_accessed_session, recent_access_sessions,
+         status, memory_type, subject, property, value_number, unit,
+         user_id, agent_id, run_id, created_at, updated_at)
+      VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertVector = this.db.prepare(
+      "INSERT OR REPLACE INTO vectors (id, vector) VALUES (?, ?)",
+    );
+
+    const txn = this.db.transaction(() => {
+      for (const card of cards) {
+        insertCard.run(
+          card.id,
+          card.text,
+          card.hash,
+          card.sessionCreated,
+          card.lastReinforcedSession,
+          card.baseStrength,
+          card.halfLifeSessions,
+          card.accessCount,
+          card.lastAccessedSession,
+          JSON.stringify(card.recentAccessSessions),
+          card.status,
+          card.memoryType || null,
+          card.subject || null,
+          card.property || null,
+          card.valueNumber ?? null,
+          card.unit || null,
+          card.userId || null,
+          card.agentId || null,
+          card.runId || null,
+          card.createdAt,
+          card.updatedAt,
+        );
+        if (card.vector) {
+          const buf = Buffer.from(new Float32Array(card.vector).buffer);
+          insertVector.run(card.id, buf);
+        }
+      }
+    });
+    txn();
+    this.invalidateIndex();
   }
 
-  async deleteCol(): Promise<void> {
-    this.db.exec(`DROP TABLE IF EXISTS vectors`);
-    this.init();
+  async search(
+    queryVector: number[],
+    topK: number,
+    filters?: SearchFilters,
+  ): Promise<Array<{ id: string; score: number; card: MemoryCard }>> {
+    this.loadIndex();
+
+    const { where, params } = this.buildWhereClause(filters);
+    const rows = this.db
+      .prepare(`SELECT * FROM cards WHERE ${where}`)
+      .all(...params) as any[];
+
+    const filteredIds = new Set(rows.map((r) => r.id));
+
+    const scored: Array<{
+      id: string;
+      score: number;
+      vector: Float32Array;
+    }> = [];
+    for (const entry of this.index) {
+      if (!filteredIds.has(entry.id)) continue;
+      const score = this.cosineSimilarity(entry.vector, queryVector);
+      scored.push({ id: entry.id, score, vector: entry.vector });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    const top = scored.slice(0, topK);
+
+    const cardMap = new Map<string, any>();
+    for (const row of rows) {
+      cardMap.set(row.id, row);
+    }
+
+    return top.map((s) => ({
+      id: s.id,
+      score: s.score,
+      card: this.cardFromRow(cardMap.get(s.id)),
+    }));
+  }
+
+  async get(id: string): Promise<MemoryCard | null> {
+    const row = this.db.prepare("SELECT * FROM cards WHERE id = ?").get(id) as
+      | any
+      | undefined;
+    if (!row) return null;
+    return this.cardFromRow(row);
+  }
+
+  async update(id: string, updates: Partial<MemoryCard>): Promise<void> {
+    const existing = await this.get(id);
+    if (!existing) throw new Error(`Card ${id} not found`);
+
+    const merged = { ...existing, ...updates };
+    merged.updatedAt = new Date().toISOString();
+
+    const stmt = this.db.prepare(`
+      UPDATE cards SET
+        text = ?, hash = ?, session_created = ?, last_reinforced_session = ?,
+        base_strength = ?, half_life_sessions = ?, access_count = ?,
+        last_accessed_session = ?, recent_access_sessions = ?,
+        status = ?, memory_type = ?, subject = ?, property = ?,
+        value_number = ?, unit = ?, user_id = ?, agent_id = ?, run_id = ?,
+        created_at = ?, updated_at = ?
+      WHERE id = ?
+    `);
+    stmt.run(
+      merged.text,
+      merged.hash,
+      merged.sessionCreated,
+      merged.lastReinforcedSession,
+      merged.baseStrength,
+      merged.halfLifeSessions,
+      merged.accessCount,
+      merged.lastAccessedSession,
+      JSON.stringify(merged.recentAccessSessions),
+      merged.status,
+      merged.memoryType || null,
+      merged.subject || null,
+      merged.property || null,
+      merged.valueNumber ?? null,
+      merged.unit || null,
+      merged.userId || null,
+      merged.agentId || null,
+      merged.runId || null,
+      merged.createdAt,
+      merged.updatedAt,
+      id,
+    );
+
+    if (updates.vector) {
+      const buf = Buffer.from(new Float32Array(updates.vector).buffer);
+      this.db
+        .prepare("UPDATE vectors SET vector = ? WHERE id = ?")
+        .run(buf, id);
+    }
+    this.invalidateIndex();
+  }
+
+  async delete(id: string): Promise<void> {
+    this.db.prepare("DELETE FROM cards WHERE id = ?").run(id);
+    this.db.prepare("DELETE FROM vectors WHERE id = ?").run(id);
+    this.invalidateIndex();
   }
 
   async list(
     filters?: SearchFilters,
     topK: number = 100,
-  ): Promise<[VectorStoreResult[], number]> {
-    const rows = this.db.prepare(`SELECT * FROM vectors`).all() as any[];
-    const results: VectorStoreResult[] = [];
-
-    for (const row of rows) {
-      const payload = this.normalizePayload(JSON.parse(row.payload));
-      const memoryVector: MemoryVector = {
-        id: row.id,
-        vector: Array.from(
-          new Float32Array(
-            row.vector.buffer,
-            row.vector.byteOffset,
-            row.vector.byteLength / 4,
-          ),
-        ),
-        payload,
-      };
-
-      if (this.filterVector(memoryVector, filters)) {
-        results.push({
-          id: memoryVector.id,
-          payload: memoryVector.payload,
-        });
-      }
-    }
-
-    return [results.slice(0, topK), results.length];
+  ): Promise<[MemoryCard[], number]> {
+    const { where, params } = this.buildWhereClause(filters);
+    const rows = this.db
+      .prepare(`SELECT * FROM cards WHERE ${where} LIMIT ?`)
+      .all(...params, topK) as any[];
+    return [rows.map((r) => this.cardFromRow(r)), rows.length];
   }
 
-  async getUserId(): Promise<string> {
-    const row = this.db
-      .prepare(`SELECT user_id FROM memory_migrations LIMIT 1`)
-      .get() as any;
-    if (row) {
-      return row.user_id;
-    }
-
-    // Generate a random user_id if none exists
-    const randomUserId =
-      Math.random().toString(36).substring(2, 15) +
-      Math.random().toString(36).substring(2, 15);
-    this.db
-      .prepare(`INSERT INTO memory_migrations (user_id) VALUES (?)`)
-      .run(randomUserId);
-    return randomUserId;
+  async deleteAll(filters?: SearchFilters): Promise<void> {
+    const { where, params } = this.buildWhereClause(filters);
+    this.db.prepare(`DELETE FROM cards WHERE ${where}`).run(...params);
+    this.db.prepare(`DELETE FROM vectors WHERE id NOT IN (SELECT id FROM cards)`).run();
+    this.invalidateIndex();
   }
 
-  async setUserId(userId: string): Promise<void> {
-    this.db.prepare(`DELETE FROM memory_migrations`).run();
-    this.db
-      .prepare(`INSERT INTO memory_migrations (user_id) VALUES (?)`)
-      .run(userId);
+  async rebuildIndex(): Promise<void> {
+    this.invalidateIndex();
+    this.loadIndex();
   }
 
   async initialize(): Promise<void> {
     this.init();
+  }
+
+  async close(): Promise<void> {
+    this.db.close();
   }
 }
